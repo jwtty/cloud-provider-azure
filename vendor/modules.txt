@@ -1,4 +1,4 @@
-# github.com/Azure/azure-sdk-for-go v64.1.0+incompatible
+# github.com/Azure/azure-sdk-for-go v65.0.0+incompatible
 ## explicit
 github.com/Azure/azure-sdk-for-go/services/authorization/mgmt/2015-07-01/authorization
 github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-07-01/compute
@@ -21,7 +21,7 @@ github.com/Azure/go-autorest
 ## explicit; go 1.15
 github.com/Azure/go-autorest/autorest
 github.com/Azure/go-autorest/autorest/azure
-# github.com/Azure/go-autorest/autorest/adal v0.9.19
+# github.com/Azure/go-autorest/autorest/adal v0.9.20
 ## explicit; go 1.15
 github.com/Azure/go-autorest/autorest/adal
 # github.com/Azure/go-autorest/autorest/date v0.3.0
@@ -548,7 +548,7 @@ gopkg.in/yaml.v2
 # gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
 ## explicit
 gopkg.in/yaml.v3
-# k8s.io/api v0.24.0
+# k8s.io/api v0.24.1
 ## explicit; go 1.16
 k8s.io/api/admission/v1
 k8s.io/api/admission/v1beta1
@@ -597,7 +597,7 @@ k8s.io/api/scheduling/v1beta1
 k8s.io/api/storage/v1
 k8s.io/api/storage/v1alpha1
 k8s.io/api/storage/v1beta1
-# k8s.io/apimachinery v0.24.0
+# k8s.io/apimachinery v0.24.1
 ## explicit; go 1.16
 k8s.io/apimachinery/pkg/api/equality
 k8s.io/apimachinery/pkg/api/errors
@@ -779,7 +779,7 @@ k8s.io/apiserver/plugin/pkg/audit/truncate
 k8s.io/apiserver/plugin/pkg/audit/webhook
 k8s.io/apiserver/plugin/pkg/authenticator/token/webhook
 k8s.io/apiserver/plugin/pkg/authorizer/webhook
-# k8s.io/client-go v0.24.0
+# k8s.io/client-go v0.24.1
 ## explicit; go 1.16
 k8s.io/client-go/applyconfigurations/admissionregistration/v1
 k8s.io/client-go/applyconfigurations/admissionregistration/v1beta1
@@ -1078,7 +1078,7 @@ k8s.io/cloud-provider/service/helpers
 k8s.io/cloud-provider/volume
 k8s.io/cloud-provider/volume/errors
 k8s.io/cloud-provider/volume/helpers
-# k8s.io/component-base v0.24.0
+# k8s.io/component-base v0.24.1
 ## explicit; go 1.16
 k8s.io/component-base/cli/flag
 k8s.io/component-base/cli/globalflag
@@ -1144,7 +1144,7 @@ k8s.io/kube-openapi/pkg/spec3
 k8s.io/kube-openapi/pkg/util
 k8s.io/kube-openapi/pkg/util/proto
 k8s.io/kube-openapi/pkg/validation/spec
-# k8s.io/kubelet v0.24.0
+# k8s.io/kubelet v0.24.1
 ## explicit; go 1.16
 k8s.io/kubelet/pkg/apis/credentialprovider
 k8s.io/kubelet/pkg/apis/credentialprovider/install
