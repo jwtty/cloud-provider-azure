@@ -5,26 +5,26 @@ package queued
 import (
 	"context"
 	"fmt"
-	"github.com/Azure/azure-pipeline-go/pipeline"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Azure/azure-kusto-go/kusto/data/errors"
+	"github.com/Azure/azure-kusto-go/kusto/ingest/ingestoptions"
 	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/gzip"
 	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/properties"
 	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/resources"
-	"github.com/google/uuid"
+	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/utils"
 
+	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-storage-queue-go/azqueue"
+	"github.com/google/uuid"
 )
 
 const (
@@ -115,7 +115,7 @@ func (i *Ingestion) Local(ctx context.Context, from string, props properties.All
 		return err
 	}
 
-	// We want to check the queue size here so so we don't upload a file and then find we don't have a Kusto queue to stick
+	// We want to check the queue size here so we don't upload a file and then find we don't have a Kusto queue to stick
 	// it in. If we don't have a container, that is handled by containerQueue().
 	if len(mgrResources.Queues) == 0 {
 		return errors.ES(errors.OpFileIngest, errors.KBlobstore, "no Kusto queue resources are defined, there is no queue to upload to").SetNoRetry()
@@ -152,24 +152,9 @@ func (i *Ingestion) Reader(ctx context.Context, reader io.Reader, props properti
 		return "", errors.ES(errors.OpFileIngest, errors.KBlobstore, "no Kusto queue resources are defined, there is no queue to upload to").SetNoRetry()
 	}
 
-	shouldCompress := true
-	if props.Source.OriginalSource != "" {
-		shouldCompress = CompressionDiscovery(props.Source.OriginalSource) == properties.CTNone
-	}
-	if props.Source.DontCompress {
-		shouldCompress = false
-	}
-
-	extension := "gz"
-	if !shouldCompress {
-		if props.Source.OriginalSource != "" {
-			extension = filepath.Ext(props.Source.OriginalSource)
-		} else {
-			extension = props.Ingestion.Additional.Format.String() // Best effort
-		}
-	}
-
-	blobName := fmt.Sprintf("%s_%s_%s_%s.%s", i.db, i.table, nower(), filepath.Base(uuid.New().String()), extension)
+	compression := utils.CompressionDiscovery(props.Source.OriginalSource)
+	shouldCompress := ShouldCompress(&props, compression)
+	blobName := GenBlobName(i.db, i.table, nower(), filepath.Base(uuid.New().String()), filepath.Base(props.Source.OriginalSource), compression, shouldCompress, props.Ingestion.Additional.Format.String())
 
 	size := int64(0)
 
@@ -273,7 +258,8 @@ func (i *Ingestion) upstreamContainer() (*azblob.Client, string, error) {
 	}
 
 	storageURI := mgrResources.Containers[rand.Intn(len(mgrResources.Containers))]
-	serviceURL := fmt.Sprintf("https://%s.blob.core.windows.net?%s", storageURI.Account(), storageURI.SAS().Encode())
+	storageUrl := storageURI.URL()
+	serviceURL := fmt.Sprintf("%s://%s?%s", storageUrl.Scheme, storageUrl.Host, storageURI.SAS().Encode())
 
 	client, err := azblob.NewClientWithNoCredential(serviceURL, &azblob.ClientOptions{
 		ClientOptions: azcore.ClientOptions{
@@ -303,7 +289,8 @@ func (i *Ingestion) upstreamQueue() (azqueue.MessagesURL, error) {
 	}
 
 	queue := mgrResources.Queues[rand.Intn(len(mgrResources.Queues))]
-	service, _ := url.Parse(fmt.Sprintf("https://%s.queue.core.windows.net?%s", queue.Account(), queue.SAS().Encode()))
+	queueUrl := queue.URL()
+	service, _ := url.Parse(fmt.Sprintf("%s://%s?%s", queueUrl.Scheme, queueUrl.Host, queue.SAS().Encode()))
 
 	p := createPipeline(i.http)
 
@@ -327,14 +314,12 @@ func createPipeline(http *http.Client) pipeline.Pipeline {
 
 var nower = time.Now
 
-// localToBlob copies from a local to to an Azure Blobstore blob. It returns the URL of the Blob, the local file info and an
+// localToBlob copies from a local to an Azure Blobstore blob. It returns the URL of the Blob, the local file info and an
 // error if there was one.
 func (i *Ingestion) localToBlob(ctx context.Context, from string, client *azblob.Client, container string, props *properties.All) (string, int64, error) {
-	compression := CompressionDiscovery(from)
-	blobName := fmt.Sprintf("%s_%s_%s_%s_%s", i.db, i.table, nower(), filepath.Base(uuid.New().String()), filepath.Base(from))
-	if compression == properties.CTNone {
-		blobName = blobName + ".gz"
-	}
+	compression := utils.CompressionDiscovery(from)
+	shouldCompress := ShouldCompress(props, compression)
+	blobName := GenBlobName(i.db, i.table, nower(), filepath.Base(uuid.New().String()), filepath.Base(from), compression, shouldCompress, props.Ingestion.Additional.Format.String())
 
 	file, err := os.Open(from)
 	if err != nil {
@@ -345,6 +330,7 @@ func (i *Ingestion) localToBlob(ctx context.Context, from string, client *azblob
 		).SetNoRetry()
 	}
 
+	defer file.Close()
 	stat, err := file.Stat()
 	if err != nil {
 		return "", 0, errors.ES(
@@ -354,7 +340,7 @@ func (i *Ingestion) localToBlob(ctx context.Context, from string, client *azblob
 		).SetNoRetry()
 	}
 
-	if compression == properties.CTNone && !props.Source.DontCompress {
+	if shouldCompress {
 		gstream := gzip.New()
 		gstream.Reset(file)
 
@@ -394,24 +380,41 @@ func (i *Ingestion) localToBlob(ctx context.Context, from string, client *azblob
 	return fullUrl(client, container, blobName), stat.Size(), nil
 }
 
-// CompressionDiscovery looks at the file extension. If it is one we support, we return that
-// CompressionType that represents that value. Otherwise we return CTNone to indicate that the
-// file should not be compressed.
-func CompressionDiscovery(fName string) properties.CompressionType {
-	var ext string
-	if strings.HasPrefix(strings.ToLower(fName), "http") {
-		ext = strings.ToLower(filepath.Ext(path.Base(fName)))
-	} else {
-		ext = strings.ToLower(filepath.Ext(fName))
+func GenBlobName(databaseName string, tableName string, time time.Time, guid string, fileName string, compressionFileExtension ingestoptions.CompressionType, shouldCompress bool, dataFormat string) string {
+	extension := "gz"
+	if !shouldCompress {
+		if compressionFileExtension == ingestoptions.CTNone {
+			extension = dataFormat
+		} else {
+			extension = compressionFileExtension.String()
+		}
+
+		extension = dataFormat
 	}
 
-	switch ext {
-	case ".gz":
-		return properties.GZIP
-	case ".zip":
-		return properties.ZIP
+	blobName := fmt.Sprintf("%s_%s_%s_%s_%s.%s", databaseName, tableName, time, guid, fileName, extension)
+
+	return blobName
+}
+
+// Do not compress if user specified in DontCompress or CompressionType,
+// if the file extension shows compression, or if the format is binary.
+func ShouldCompress(props *properties.All, compressionFileExtension ingestoptions.CompressionType) bool {
+	if props.Source.DontCompress {
+		return false
 	}
-	return properties.CTNone
+
+	if props.Source.CompressionType != ingestoptions.CTUnknown {
+		if props.Source.CompressionType != ingestoptions.CTNone {
+			return false
+		}
+	} else {
+		if compressionFileExtension != ingestoptions.CTUnknown && compressionFileExtension != ingestoptions.CTNone {
+			return false
+		}
+	}
+
+	return props.Ingestion.Additional.Format.ShouldCompress()
 }
 
 // This allows mocking the stat func later on
@@ -446,7 +449,7 @@ func IsLocalPath(s string) (bool, error) {
 	return true, nil
 }
 
-func fullUrl(client *azblob.Client, container, blob string) string {
+func fullUrl(client *azblob.Client, container string, blob string) string {
 	parseURL, err := azblob.ParseURL(client.URL())
 	if err != nil {
 		return ""
