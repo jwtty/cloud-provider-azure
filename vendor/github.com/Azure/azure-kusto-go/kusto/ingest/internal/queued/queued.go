@@ -5,26 +5,25 @@ package queued
 import (
 	"context"
 	"fmt"
-	"github.com/Azure/azure-pipeline-go/pipeline"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"io"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Azure/azure-kusto-go/kusto/data/errors"
+	"github.com/Azure/azure-kusto-go/kusto/ingest/ingestoptions"
 	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/gzip"
 	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/properties"
 	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/resources"
-	"github.com/google/uuid"
+	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/utils"
 
+	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-storage-queue-go/azqueue"
+	"github.com/google/uuid"
 )
 
 const (
@@ -35,8 +34,9 @@ const (
 	// made a 5x improvement in speed. We don't have any numbers from the service side to give us numbers we should use, so this
 	// is our best guess from observation. DO NOT CHANGE UNLESS YOU KNOW BETTER.
 
-	BlockSize   = 8 * _1MiB
-	Concurrency = 50
+	BlockSize             = 8 * _1MiB
+	Concurrency           = 50
+	StorageMaxRetryPolicy = 3
 )
 
 // Queued provides methods for taking data from various sources and ingesting it into Kusto using queued ingestion.
@@ -66,6 +66,9 @@ type Ingestion struct {
 
 	bufferSize int
 	maxBuffers int
+
+	applicationForTracing   string
+	clientVersionForTracing string
 }
 
 // Option is an optional argument to New().
@@ -80,7 +83,7 @@ func WithStaticBuffer(bufferSize int, maxBuffers int) Option {
 }
 
 // New is the constructor for Ingestion.
-func New(db, table string, mgr *resources.Manager, http *http.Client, options ...Option) (*Ingestion, error) {
+func New(db, table string, mgr *resources.Manager, http *http.Client, applicationForTracing string, clientVersionForTracing string, options ...Option) (*Ingestion, error) {
 	i := &Ingestion{
 		db:    db,
 		table: table,
@@ -94,6 +97,8 @@ func New(db, table string, mgr *resources.Manager, http *http.Client, options ..
 			options *azblob.UploadFileOptions) (azblob.UploadFileResponse, error) {
 			return client.UploadFile(ctx, container, blob, file, options)
 		},
+		applicationForTracing:   applicationForTracing,
+		clientVersionForTracing: clientVersionForTracing,
 	}
 
 	for _, opt := range options {
@@ -105,71 +110,90 @@ func New(db, table string, mgr *resources.Manager, http *http.Client, options ..
 
 // Local ingests a local file into Kusto.
 func (i *Ingestion) Local(ctx context.Context, from string, props properties.All) error {
-	client, container, err := i.upstreamContainer()
+	containers, err := i.mgr.GetRankedStorageContainers()
 	if err != nil {
 		return err
 	}
 
-	mgrResources, err := i.mgr.Resources()
+	if len(containers) == 0 {
+		return errors.ES(
+			errors.OpFileIngest,
+			errors.KBlobstore,
+			"no Blob Storage container resources are defined, there is no container to upload to",
+		).SetNoRetry()
+	}
+
+	queues, err := i.mgr.GetRankedStorageQueues()
 	if err != nil {
 		return err
 	}
 
-	// We want to check the queue size here so so we don't upload a file and then find we don't have a Kusto queue to stick
+	// We want to check the queue size here so we don't upload a file and then find we don't have a Kusto queue to stick
 	// it in. If we don't have a container, that is handled by containerQueue().
-	if len(mgrResources.Queues) == 0 {
+	if len(queues) == 0 {
 		return errors.ES(errors.OpFileIngest, errors.KBlobstore, "no Kusto queue resources are defined, there is no queue to upload to").SetNoRetry()
 	}
 
-	blobURL, size, err := i.localToBlob(ctx, from, client, container, &props)
-	if err != nil {
-		return err
+	// Go over all the containers and try to upload the file to each one. If we succeed, we are done.
+	for attempts, containerUri := range containers {
+		if attempts >= StorageMaxRetryPolicy {
+			return errors.ES(errors.OpFileIngest, errors.KBlobstore, "max retry policy reached").SetNoRetry()
+		}
+
+		client, containerName, err := i.upstreamContainer(containerUri)
+		if err != nil {
+			i.mgr.ReportStorageResourceResult(containerUri.Account(), false)
+			continue
+		}
+
+		blobURL, size, err := i.localToBlob(ctx, from, client, containerName, &props)
+		if err == nil {
+			i.mgr.ReportStorageResourceResult(containerUri.Account(), true)
+			return i.Blob(ctx, blobURL, size, props)
+		}
+
+		// check if the error is retryable
+		if errors.Retry(err) {
+			i.mgr.ReportStorageResourceResult(containerUri.Account(), false)
+			continue
+		} else {
+			return err
+		}
 	}
 
-	if err := i.Blob(ctx, blobURL, size, props); err != nil {
-		return err
-	}
-
-	return nil
+	return errors.ES(errors.OpFileIngest, errors.KBlobstore, "could not upload file to any container")
 }
 
 // Reader uploads a file via an io.Reader.
 // If the function succeeds, it returns the path of the created blob.
 func (i *Ingestion) Reader(ctx context.Context, reader io.Reader, props properties.All) (string, error) {
-	to, toContainer, err := i.upstreamContainer()
+	containers, err := i.mgr.GetRankedStorageContainers()
 	if err != nil {
 		return "", err
 	}
 
-	mgrResources, err := i.mgr.Resources()
+	if len(containers) == 0 {
+		return "", errors.ES(
+			errors.OpFileIngest,
+			errors.KBlobstore,
+			"no Blob Storage container resources are defined, there is no container to upload to",
+		).SetNoRetry()
+	}
+
+	queues, err := i.mgr.GetRankedStorageQueues()
 	if err != nil {
 		return "", err
 	}
 
 	// We want to check the queue size here so so we don't upload a file and then find we don't have a Kusto queue to stick
 	// it in. If we don't have a container, that is handled by containerQueue().
-	if len(mgrResources.Queues) == 0 {
+	if len(queues) == 0 {
 		return "", errors.ES(errors.OpFileIngest, errors.KBlobstore, "no Kusto queue resources are defined, there is no queue to upload to").SetNoRetry()
 	}
 
-	shouldCompress := true
-	if props.Source.OriginalSource != "" {
-		shouldCompress = CompressionDiscovery(props.Source.OriginalSource) == properties.CTNone
-	}
-	if props.Source.DontCompress {
-		shouldCompress = false
-	}
-
-	extension := "gz"
-	if !shouldCompress {
-		if props.Source.OriginalSource != "" {
-			extension = filepath.Ext(props.Source.OriginalSource)
-		} else {
-			extension = props.Ingestion.Additional.Format.String() // Best effort
-		}
-	}
-
-	blobName := fmt.Sprintf("%s_%s_%s_%s.%s", i.db, i.table, nower(), filepath.Base(uuid.New().String()), extension)
+	compression := utils.CompressionDiscovery(props.Source.OriginalSource)
+	shouldCompress := ShouldCompress(&props, compression)
+	blobName := GenBlobName(i.db, i.table, nower(), filepath.Base(uuid.New().String()), filepath.Base(props.Source.OriginalSource), compression, shouldCompress, props.Ingestion.Additional.Format.String())
 
 	size := int64(0)
 
@@ -177,27 +201,41 @@ func (i *Ingestion) Reader(ctx context.Context, reader io.Reader, props properti
 		reader = gzip.Compress(reader)
 	}
 
-	_, err = i.uploadStream(
-		ctx,
-		reader,
-		to,
-		toContainer,
-		blobName,
-		&azblob.UploadStreamOptions{BlockSize: int64(i.bufferSize), Concurrency: i.maxBuffers},
-	)
+	// Go over all the containers and try to upload the file to each one. If we succeed, we are done.
+	for attempts, containerUri := range containers {
+		if attempts >= StorageMaxRetryPolicy {
+			return "", errors.ES(errors.OpFileIngest, errors.KBlobstore, "max retry policy reached").SetNoRetry()
+		}
 
-	if err != nil {
-		return blobName, errors.ES(errors.OpFileIngest, errors.KBlobstore, "problem uploading to Blob Storage: %s", err)
-	}
+		client, containerName, err := i.upstreamContainer(containerUri)
+		if err != nil {
+			i.mgr.ReportStorageResourceResult(containerUri.Account(), false)
+			continue
+		}
 
-	if gz, ok := reader.(*gzip.Streamer); ok {
-		size = gz.InputSize()
-	}
-	if err := i.Blob(ctx, fullUrl(to, toContainer, blobName), size, props); err != nil {
+		_, err = i.uploadStream(
+			ctx,
+			reader,
+			client,
+			containerName,
+			blobName,
+			&azblob.UploadStreamOptions{BlockSize: int64(i.bufferSize), Concurrency: i.maxBuffers},
+		)
+
+		if err != nil {
+			i.mgr.ReportStorageResourceResult(containerUri.Account(), false)
+			continue
+		}
+
+		i.mgr.ReportStorageResourceResult(containerUri.Account(), true)
+		if gz, ok := reader.(*gzip.Streamer); ok {
+			size = gz.InputSize()
+		}
+		err = i.Blob(ctx, fullUrl(client, containerName, blobName), size, props)
 		return blobName, err
 	}
 
-	return blobName, nil
+	return blobName, errors.ES(errors.OpFileIngest, errors.KBlobstore, "problem uploading to Blob Storage")
 }
 
 // Blob ingests a file from Azure Blob Storage into Kusto.
@@ -207,19 +245,16 @@ func (i *Ingestion) Blob(ctx context.Context, from string, fileSize int64, props
 	// To learn more about ingestion methods go to:
 	// https://docs.microsoft.com/en-us/azure/data-explorer/ingest-data-overview#ingestion-methods
 
-	to, err := i.upstreamQueue()
-	if err != nil {
-		return err
-	}
-
 	props.Ingestion.BlobPath = from
 	if fileSize != 0 {
 		props.Ingestion.RawDataSize = fileSize
 	}
 
 	props.Ingestion.RetainBlobOnSuccess = !props.Source.DeleteLocalSource
+	props.Ingestion.ApplicationForTracing = i.applicationForTracing
+	props.Ingestion.ClientVersionForTracing = i.clientVersionForTracing
 
-	err = CompleteFormatFromFileName(&props, from)
+	err := CompleteFormatFromFileName(&props, from)
 	if err != nil {
 		return err
 	}
@@ -229,16 +264,27 @@ func (i *Ingestion) Blob(ctx context.Context, from string, fileSize int64, props
 		return errors.ES(errors.OpFileIngest, errors.KInternal, "could not marshal the ingestion blob info: %s", err).SetNoRetry()
 	}
 
-	if _, err := to.Enqueue(ctx, j, 0, 0); err != nil {
-		return errors.E(errors.OpFileIngest, errors.KBlobstore, err)
-	}
-
-	err = props.ApplyDeleteLocalSourceOption()
+	queueResources, err := i.mgr.GetRankedStorageQueues()
 	if err != nil {
 		return err
 	}
 
-	return nil
+	// Go over all the queues and try to upload the file to each one. If we succeed, we are done.
+	for attempts, queueUri := range queueResources {
+		if attempts >= StorageMaxRetryPolicy {
+			return errors.ES(errors.OpFileIngest, errors.KBlobstore, "max retry policy reached").SetNoRetry()
+		}
+		queueClient := i.upstreamQueue(queueUri)
+		if _, err := queueClient.Enqueue(ctx, j, 0, 0); err != nil {
+			i.mgr.ReportStorageResourceResult(queueUri.Account(), false)
+			continue
+		} else {
+			i.mgr.ReportStorageResourceResult(queueUri.Account(), true)
+			return props.ApplyDeleteLocalSourceOption()
+		}
+	}
+
+	return errors.ES(errors.OpFileIngest, errors.KBlobstore, "could not upload file to any queue")
 }
 
 func CompleteFormatFromFileName(props *properties.All, from string) error {
@@ -257,23 +303,9 @@ func CompleteFormatFromFileName(props *properties.All, from string) error {
 	return nil
 }
 
-// upstreamContainer randomly selects a container queue in which to upload our file to blobstore.
-func (i *Ingestion) upstreamContainer() (*azblob.Client, string, error) {
-	mgrResources, err := i.mgr.Resources()
-	if err != nil {
-		return nil, "", errors.E(errors.OpFileIngest, errors.KBlobstore, err)
-	}
-
-	if len(mgrResources.Containers) == 0 {
-		return nil, "", errors.ES(
-			errors.OpFileIngest,
-			errors.KBlobstore,
-			"no Blob Storage container resources are defined, there is no container to upload to",
-		).SetNoRetry()
-	}
-
-	storageURI := mgrResources.Containers[rand.Intn(len(mgrResources.Containers))]
-	serviceURL := fmt.Sprintf("https://%s.blob.core.windows.net?%s", storageURI.Account(), storageURI.SAS().Encode())
+func (i *Ingestion) upstreamContainer(resourceUri *resources.URI) (*azblob.Client, string, error) {
+	storageUrl := resourceUri.URL()
+	serviceURL := fmt.Sprintf("%s://%s?%s", storageUrl.Scheme, storageUrl.Host, resourceUri.SAS().Encode())
 
 	client, err := azblob.NewClientWithNoCredential(serviceURL, &azblob.ClientOptions{
 		ClientOptions: azcore.ClientOptions{
@@ -285,29 +317,16 @@ func (i *Ingestion) upstreamContainer() (*azblob.Client, string, error) {
 		return nil, "", errors.E(errors.OpFileIngest, errors.KBlobstore, err)
 	}
 
-	return client, storageURI.ObjectName(), nil
+	return client, resourceUri.ObjectName(), nil
 }
 
-func (i *Ingestion) upstreamQueue() (azqueue.MessagesURL, error) {
-	mgrResources, err := i.mgr.Resources()
-	if err != nil {
-		return azqueue.MessagesURL{}, err
-	}
-
-	if len(mgrResources.Queues) == 0 {
-		return azqueue.MessagesURL{}, errors.ES(
-			errors.OpFileIngest,
-			errors.KBlobstore,
-			"no Kusto queue resources are defined, there is no queue to upload to",
-		).SetNoRetry()
-	}
-
-	queue := mgrResources.Queues[rand.Intn(len(mgrResources.Queues))]
-	service, _ := url.Parse(fmt.Sprintf("https://%s.queue.core.windows.net?%s", queue.Account(), queue.SAS().Encode()))
+func (i *Ingestion) upstreamQueue(resourceUri *resources.URI) azqueue.MessagesURL {
+	queueUrl := resourceUri.URL()
+	service, _ := url.Parse(fmt.Sprintf("%s://%s?%s", queueUrl.Scheme, queueUrl.Host, resourceUri.SAS().Encode()))
 
 	p := createPipeline(i.http)
 
-	return azqueue.NewServiceURL(*service, p).NewQueueURL(queue.ObjectName()).NewMessagesURL(), nil
+	return azqueue.NewServiceURL(*service, p).NewQueueURL(resourceUri.ObjectName()).NewMessagesURL()
 }
 
 func createPipeline(http *http.Client) pipeline.Pipeline {
@@ -327,14 +346,12 @@ func createPipeline(http *http.Client) pipeline.Pipeline {
 
 var nower = time.Now
 
-// localToBlob copies from a local to to an Azure Blobstore blob. It returns the URL of the Blob, the local file info and an
+// localToBlob copies from a local to an Azure Blobstore blob. It returns the URL of the Blob, the local file info and an
 // error if there was one.
 func (i *Ingestion) localToBlob(ctx context.Context, from string, client *azblob.Client, container string, props *properties.All) (string, int64, error) {
-	compression := CompressionDiscovery(from)
-	blobName := fmt.Sprintf("%s_%s_%s_%s_%s", i.db, i.table, nower(), filepath.Base(uuid.New().String()), filepath.Base(from))
-	if compression == properties.CTNone {
-		blobName = blobName + ".gz"
-	}
+	compression := utils.CompressionDiscovery(from)
+	shouldCompress := ShouldCompress(props, compression)
+	blobName := GenBlobName(i.db, i.table, nower(), filepath.Base(uuid.New().String()), filepath.Base(from), compression, shouldCompress, props.Ingestion.Additional.Format.String())
 
 	file, err := os.Open(from)
 	if err != nil {
@@ -345,6 +362,7 @@ func (i *Ingestion) localToBlob(ctx context.Context, from string, client *azblob
 		).SetNoRetry()
 	}
 
+	defer file.Close()
 	stat, err := file.Stat()
 	if err != nil {
 		return "", 0, errors.ES(
@@ -354,7 +372,7 @@ func (i *Ingestion) localToBlob(ctx context.Context, from string, client *azblob
 		).SetNoRetry()
 	}
 
-	if compression == properties.CTNone && !props.Source.DontCompress {
+	if shouldCompress {
 		gstream := gzip.New()
 		gstream.Reset(file)
 
@@ -394,24 +412,41 @@ func (i *Ingestion) localToBlob(ctx context.Context, from string, client *azblob
 	return fullUrl(client, container, blobName), stat.Size(), nil
 }
 
-// CompressionDiscovery looks at the file extension. If it is one we support, we return that
-// CompressionType that represents that value. Otherwise we return CTNone to indicate that the
-// file should not be compressed.
-func CompressionDiscovery(fName string) properties.CompressionType {
-	var ext string
-	if strings.HasPrefix(strings.ToLower(fName), "http") {
-		ext = strings.ToLower(filepath.Ext(path.Base(fName)))
-	} else {
-		ext = strings.ToLower(filepath.Ext(fName))
+func GenBlobName(databaseName string, tableName string, time time.Time, guid string, fileName string, compressionFileExtension ingestoptions.CompressionType, shouldCompress bool, dataFormat string) string {
+	extension := "gz"
+	if !shouldCompress {
+		if compressionFileExtension == ingestoptions.CTNone {
+			extension = dataFormat
+		} else {
+			extension = compressionFileExtension.String()
+		}
+
+		extension = dataFormat
 	}
 
-	switch ext {
-	case ".gz":
-		return properties.GZIP
-	case ".zip":
-		return properties.ZIP
+	blobName := fmt.Sprintf("%s_%s_%s_%s_%s.%s", databaseName, tableName, time, guid, fileName, extension)
+
+	return blobName
+}
+
+// Do not compress if user specified in DontCompress or CompressionType,
+// if the file extension shows compression, or if the format is binary.
+func ShouldCompress(props *properties.All, compressionFileExtension ingestoptions.CompressionType) bool {
+	if props.Source.DontCompress {
+		return false
 	}
-	return properties.CTNone
+
+	if props.Source.CompressionType != ingestoptions.CTUnknown {
+		if props.Source.CompressionType != ingestoptions.CTNone {
+			return false
+		}
+	} else {
+		if compressionFileExtension != ingestoptions.CTUnknown && compressionFileExtension != ingestoptions.CTNone {
+			return false
+		}
+	}
+
+	return props.Ingestion.Additional.Format.ShouldCompress()
 }
 
 // This allows mocking the stat func later on
@@ -446,7 +481,7 @@ func IsLocalPath(s string) (bool, error) {
 	return true, nil
 }
 
-func fullUrl(client *azblob.Client, container, blob string) string {
+func fullUrl(client *azblob.Client, container string, blob string) string {
 	parseURL, err := azblob.ParseURL(client.URL())
 	if err != nil {
 		return ""
