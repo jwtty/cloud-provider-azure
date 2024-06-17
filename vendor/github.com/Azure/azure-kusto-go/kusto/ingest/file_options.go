@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-kusto-go/kusto/data/errors"
+	"github.com/Azure/azure-kusto-go/kusto/ingest/ingestoptions"
 	"github.com/Azure/azure-kusto-go/kusto/ingest/internal/properties"
 	"github.com/cenkalti/backoff/v4"
 )
@@ -119,7 +120,8 @@ func Table(name string) FileOption {
 	}
 }
 
-// DontCompress sets whether to compress the data.
+// DontCompress sets whether to compress the data. 	In streaming - do not pass DontCompress if file is not already compressed.
+
 func DontCompress() FileOption {
 	return option{
 		run: func(p *properties.All) error {
@@ -144,7 +146,7 @@ func backOff(off *backoff.ExponentialBackOff) FileOption {
 	}
 }
 
-// FlushImmediately tells Kusto to flush on write.
+// FlushImmediately  the service batching manager will not aggregate this file, thus overriding the batching policy
 func FlushImmediately() FileOption {
 	return option{
 		run: func(p *properties.All) error {
@@ -154,6 +156,19 @@ func FlushImmediately() FileOption {
 		clientScopes: QueuedClient | ManagedClient,
 		sourceScope:  FromFile | FromReader | FromBlob,
 		name:         "FlushImmediately",
+	}
+}
+
+// IgnoreFirstRecord tells Kusto to flush on write.
+func IgnoreFirstRecord() FileOption {
+	return option{
+		run: func(p *properties.All) error {
+			p.Ingestion.Additional.IgnoreFirstRecord = true
+			return nil
+		},
+		clientScopes: QueuedClient | ManagedClient,
+		sourceScope:  FromFile | FromReader | FromBlob,
+		name:         "IgnoreFirstRecord",
 	}
 }
 
@@ -206,19 +221,25 @@ const (
 	SingleJSON DataFormat = properties.SingleJSON
 )
 
-// IngestionMapping provides runtime mapping of the data being imported to the fields in the table.
-// "ref" will be JSON encoded, so it can be any type that can be JSON marshalled. If you pass a string
+// InferFormatFromFileName looks at the file name and tries to discern what the file format is
+func InferFormatFromFileName(fName string) DataFormat {
+	return properties.DataFormatDiscovery(fName)
+}
+
+// IngestionMapping provides runtime mapping of the data being imported to the columns in the table.
+// "mapping" will be JSON encoded, so it can be any type that can be JSON marshalled. If you pass a string
 // or []byte, it will be interpreted as already being JSON encoded.
-// mappingKind can only be: CSV, JSON, AVRO, Parquet or ORC.
-// The mappingKind parameter will also automatically set the FileFormat option.
-func IngestionMapping(mapping interface{}, mappingKind DataFormat) FileOption {
+// The format parameter will automatically set the FileOption.Format option.
+func IngestionMapping(mapping interface{}, format DataFormat) FileOption {
 	return option{
 		run: func(p *properties.All) error {
-			if !mappingKind.IsValidMappingKind() {
+			kind := format.MappingKind()
+
+			if kind == DFUnknown {
 				return errors.ES(
 					errors.OpUnknown,
 					errors.KClientArgs,
-					"IngestionMapping() option does not support EncodingType %v", mappingKind,
+					"IngestionMapping() option does not support EncodingType %v", format,
 				).SetNoRetry()
 			}
 
@@ -241,8 +262,8 @@ func IngestionMapping(mapping interface{}, mappingKind DataFormat) FileOption {
 			}
 
 			p.Ingestion.Additional.IngestionMapping = j
-			p.Ingestion.Additional.IngestionMappingType = mappingKind
-			p.Ingestion.Additional.Format = mappingKind
+			p.Ingestion.Additional.IngestionMappingType = kind
+			p.Ingestion.Additional.Format = format
 
 			return nil
 		},
@@ -253,18 +274,18 @@ func IngestionMapping(mapping interface{}, mappingKind DataFormat) FileOption {
 }
 
 // IngestionMappingRef provides the name of a pre-created mapping for the data being imported to the fields in the table.
-// mappingKind can only be: CSV, JSON, AVRO, Parquet or ORC.
-// For more details, see: https://docs.microsoft.com/en-us/azure/kusto/management/create-ingestion-mapping-command
-// The mappingKind parameter will also automatically set the FileFormat option.
-func IngestionMappingRef(refName string, mappingKind DataFormat) FileOption {
+// For more details, see: https://docs.microsoft.com/azure/kusto/management/create-ingestion-mapping-command
+// The formatparameter will also automatically set the FileOption.Format option.
+func IngestionMappingRef(refName string, format DataFormat) FileOption {
 	return option{
 		run: func(p *properties.All) error {
-			if !mappingKind.IsValidMappingKind() {
-				return errors.ES(errors.OpUnknown, errors.KClientArgs, "IngestionMappingRef() option does not support EncodingType %v", mappingKind).SetNoRetry()
+			kind := format.MappingKind()
+			if kind == DFUnknown {
+				return errors.ES(errors.OpUnknown, errors.KClientArgs, "IngestionMappingRef() option does not support EncodingType %v", format).SetNoRetry()
 			}
 			p.Ingestion.Additional.IngestionMappingRef = refName
-			p.Ingestion.Additional.IngestionMappingType = mappingKind
-			p.Ingestion.Additional.Format = mappingKind
+			p.Ingestion.Additional.IngestionMappingType = kind
+			p.Ingestion.Additional.Format = format
 			return nil
 		},
 		clientScopes: QueuedClient | StreamingClient | ManagedClient,
@@ -439,5 +460,34 @@ func ClientRequestId(clientRequestId string) FileOption {
 		sourceScope:  FromFile | FromReader | FromBlob,
 		clientScopes: StreamingClient | ManagedClient,
 		name:         "ClientRequestId",
+	}
+}
+
+// CompressionType sets the compression type of the data.
+// Use this if the file name does not expose the compression type.
+// This sets DontCompress to true for compressed data.
+func CompressionType(compressionType ingestoptions.CompressionType) FileOption {
+	return option{
+		run: func(p *properties.All) error {
+			p.Source.CompressionType = compressionType
+			return nil
+		},
+		clientScopes: QueuedClient | StreamingClient | ManagedClient,
+		sourceScope:  FromFile | FromReader,
+		name:         "CompressionType",
+	}
+}
+
+// RawDataSize is the uncompressed data size. Should be used to comunicate the file size to the service for efficient ingestion.
+// Also used by managed client in the decision to use queued ingestion instead of streaming (if > 4mb)
+func RawDataSize(size int64) FileOption {
+	return option{
+		run: func(p *properties.All) error {
+			p.Ingestion.RawDataSize = size
+			return nil
+		},
+		clientScopes: QueuedClient | ManagedClient,
+		sourceScope:  FromFile | FromReader | FromBlob,
+		name:         "RawDataSize",
 	}
 }
